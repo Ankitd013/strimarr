@@ -1,0 +1,20 @@
+name: Bug report
+description: Report a reproducible Strimarr issue
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Plugin, Jellyfin and client versions
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps, expected behavior and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove tokens, cookies, signed URLs and personal information. Do not upload configuration backups.

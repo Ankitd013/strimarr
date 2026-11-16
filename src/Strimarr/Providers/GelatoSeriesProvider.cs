@@ -1,0 +1,256 @@
+using Gelato.Services;
+using Jellyfin.Data.Enums;
+using Jellyfin.Data.Events;
+using MediaBrowser.Common.Net;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Providers;
+using Microsoft.Extensions.Logging;
+
+namespace Gelato.Providers;
+
+public sealed class GelatoSeriesProvider : IRemoteMetadataProvider<Series, SeriesInfo>, IHasOrder
+{
+    private readonly ILogger<GelatoSeriesProvider> _log;
+    private readonly ILibraryManager _libraryManager;
+    private readonly GelatoManager _manager;
+    private readonly IProviderManager _provider;
+    private readonly IHttpClientFactory _http;
+    private readonly GelatoCache _cache;
+    private static readonly TimeSpan CacheExpiry = TimeSpan.FromMinutes(2);
+
+    public GelatoSeriesProvider(
+        ILogger<GelatoSeriesProvider> logger,
+        ILibraryManager libraryManager,
+        IProviderManager provider,
+        GelatoManager manager,
+        IHttpClientFactory http,
+        GelatoCache cache
+    )
+    {
+        _cache = cache;
+        _log = logger;
+        _libraryManager = libraryManager;
+        _manager = manager;
+        _provider = provider;
+        _http = http;
+
+        _provider.RefreshStarted += OnProviderManagerRefreshStarted;
+    }
+
+    public string Name => "Gelato";
+
+    public int Order => 0;
+
+    private string ProviderName => Name;
+
+    private async void OnProviderManagerRefreshStarted(
+        object? sender,
+        GenericEventArgs<BaseItem> genericEventArgs
+    )
+    {
+        if (!IsEnabledForLibrary(genericEventArgs.Argument))
+        {
+            _log.LogTrace(
+                "{ProviderName} not enabled for {InputName}",
+                ProviderName,
+                genericEventArgs.Argument.Name
+            );
+            return;
+        }
+
+        if (genericEventArgs.Argument is not Series series)
+        {
+            _log.LogTrace("{Name} is not a Series", genericEventArgs.Argument.Name);
+            return;
+        }
+
+        // After the checks above: every item's refresh passes through here, and warning for each
+        // movie of a library scan says nothing new.
+        var cfg = GelatoPlugin.Instance!.GetConfig(Guid.Empty);
+        var stremio = cfg.Stremio;
+        if (stremio == null)
+        {
+            _log.LogWarning("Gelato not configured (stremio provider missing); skipping refresh.");
+            return;
+        }
+
+        if (!await stremio.IsReady().ConfigureAwait(false))
+        {
+            _log.LogWarning("Gelato is not ready");
+            return;
+        }
+
+        // Check cache
+        var now = DateTime.UtcNow;
+        if (!_cache.TryGet(GelatoCache.SeriesSync, series.Id.ToString(), out DateTime lastSync))
+        {
+            lastSync = genericEventArgs.Argument.DateLastSaved;
+        }
+
+        if (now - lastSync < CacheExpiry)
+        {
+            _log.LogDebug(
+                "Skipping {Name} - synced {Seconds} seconds ago",
+                series.Name,
+                (now - lastSync).TotalSeconds
+            );
+            return;
+        }
+
+        // Update cache before syncing
+        _cache.Set(GelatoCache.SeriesSync, series.Id.ToString(), now);
+
+        var isLocal = !series.HasStremioId();
+
+        if (isLocal && !cfg.ExtendLocalSeriesTrees)
+            return;
+
+        // Guard against race condition: RefreshStarted fires inside RefreshMetadata (GelatoManager.cs:692)
+        // before AddChild/UpdateToRepositoryAsync persist the stub (lines 693-694). If Stremio metadata
+        // is cached the handler can complete and create a duplicate before the original is saved.
+        if (_libraryManager.GetItemById(series.Id) is null)
+            return;
+
+        var seriesFolder = cfg.SeriesFolder;
+        if (!isLocal && seriesFolder is null)
+        {
+            _log.LogWarning("No series folder found");
+            return;
+        }
+
+        try
+        {
+            var meta = await stremio.GetMetaAsync(series).ConfigureAwait(false);
+            if (meta is null)
+            {
+                _log.LogWarning("Skipping {Name} - no metadata found", series.Name);
+                return;
+            }
+
+            await _manager.SyncSeriesTreesAsync(cfg, meta, CancellationToken.None, existingSeries: isLocal ? series : null);
+            _log.LogInformation("synced series tree for {Name}", series.Name);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "failed sync series for {Name}", series.Name);
+        }
+    }
+
+    public async Task<MetadataResult<Series>> GetMetadata(
+        SeriesInfo info,
+        CancellationToken cancellationToken
+    )
+    {
+        var result = new MetadataResult<Series> { HasMetadata = false, QueriedById = true };
+
+        if (!GelatoStremioProvider.HasMetaId(info.ProviderIds))
+        {
+            _log.LogDebug("GelatoSeriesProvider: no usable ID for {Name}", info.Name);
+            return result;
+        }
+
+        var stremio = GelatoPlugin.Instance?.Configuration.Stremio;
+        if (stremio is null)
+            return result;
+
+        StremioMeta? meta;
+        try
+        {
+            meta = await stremio
+                .GetMetaAsync(info.ProviderIds, StremioMediaType.Series)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "GelatoSeriesProvider: failed to fetch meta for {Name}", info.Name);
+            return result;
+        }
+
+        if (meta is null || !meta.IsValid())
+            return result;
+
+        if (_manager.IntoBaseItem(meta) is not Series series)
+            return result;
+
+        series.ProviderIds.Remove("Stremio");
+        series.KeepEndDateOnlyForGelato(info.ProviderIds);
+        result.HasMetadata = true;
+        result.Item = series;
+        MapPeople(meta, result);
+        return result;
+    }
+
+    public async Task<IEnumerable<RemoteSearchResult>> GetSearchResults(
+        SeriesInfo searchInfo,
+        CancellationToken cancellationToken
+    )
+    {
+        var stremio = GelatoPlugin.Instance?.Configuration.Stremio;
+        if (stremio is null || string.IsNullOrWhiteSpace(searchInfo.Name))
+            return [];
+
+        try
+        {
+            var results = await stremio
+                .SearchAsync(searchInfo.Name, StremioMediaType.Series)
+                .ConfigureAwait(false);
+            return results.Select(ToSearchResult);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "GelatoSeriesProvider: search failed for {Name}", searchInfo.Name);
+            return [];
+        }
+    }
+
+    public Task<HttpResponseMessage> GetImageResponse(
+        string url,
+        CancellationToken cancellationToken
+    ) => _http.CreateClient(NamedClient.Default).GetAsync(url, cancellationToken);
+
+    private static void MapPeople(StremioMeta meta, MetadataResult<Series> result)
+    {
+        foreach (var person in MetaPeople.From(meta))
+            result.AddPerson(person);
+    }
+
+    private static RemoteSearchResult ToSearchResult(StremioMeta meta) =>
+        new()
+        {
+            Name = meta.GetName(),
+            ProductionYear = meta.GetYear(),
+            ImageUrl = meta.Poster ?? meta.Thumbnail,
+            ProviderIds = meta.GetProviderIds(),
+        };
+
+    private bool IsEnabledForLibrary(BaseItem item)
+    {
+        var series = item switch
+        {
+            Episode episode => episode.Series,
+            Season season => season.Series,
+            _ => item as Series,
+        };
+
+        if (series == null)
+        {
+            _log.LogTrace(
+                "Given input is not in {@ValidTypes}: {Type}",
+                new[] { nameof(Series), nameof(Season), nameof(Episode) },
+                item.GetType()
+            );
+            return false;
+        }
+
+        var libraryOptions = _libraryManager.GetLibraryOptions(series);
+        var typeOptions = libraryOptions.GetTypeOptions(series.GetType().Name);
+
+        // Check if this metadata fetcher is enabled in the library options
+        return typeOptions?.MetadataFetchers?.Contains(Name, StringComparer.OrdinalIgnoreCase)
+            ?? false;
+    }
+}

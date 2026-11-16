@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Strimarr</AssemblyName>
+    <RootNamespace>Gelato</RootNamespace>
+    <Version>1.1.0</Version>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Jellyfin.Model" Version="12.1.0" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.1.0" />
+    <PackageReference Include="Jellyfin.Common" Version="12.1.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="System.Reflection.TypeExtensions" Version="4.7.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Config\config.html" />
+    <EmbeddedResource Include="Config\*.css" />
+    <EmbeddedResource Include="Config\*.js" />
+    <!-- Embed all frontend assets so they are delivered with the plugin -->
+    <EmbeddedResource Include="Frontend\**\*" />
+  </ItemGroup>
+  <Target Name="CleanupJellyfinDlls" AfterTargets="Build">
+    <ItemGroup>
+      <AllDlls Include="$(OutDir)*.dll" />
+      <FilesToKeep
+        Include="&#xA;        $(OutDir)Strimarr.dll;&#xA;        $(OutDir)JellyfinLoaderStub*.dll;  &#xA;        $(OutDir)0Harmony.dll"
+      />
+      <FilesToDelete Include="@(AllDlls)" Exclude="@(FilesToKeep)" />
+    </ItemGroup>
+    <Delete Files="@(FilesToDelete)" />
+  </Target>
+</Project>

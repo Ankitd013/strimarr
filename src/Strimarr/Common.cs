@@ -1,0 +1,1167 @@
+using System.Collections.Concurrent;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Jellyfin.Data.Enums;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.MediaInfo;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.Mvc.Controllers;
+using Microsoft.AspNetCore.Mvc.Filters;
+
+namespace Gelato;
+
+public sealed class StremioUri
+{
+    public StremioMediaType MediaType { get; }
+    public string ExternalId { get; }
+    private readonly string? _streamId;
+
+    public StremioUri(StremioMediaType mediaType, string? externalId, string? streamId = null)
+    {
+        if (string.IsNullOrWhiteSpace(externalId))
+            throw new ArgumentException("externalId cannot be null or empty.", nameof(externalId));
+
+        MediaType = mediaType;
+        ExternalId = externalId;
+        _streamId = string.IsNullOrWhiteSpace(streamId) ? null : streamId;
+    }
+
+    public static StremioUri? FromBaseItem(BaseItem item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+
+        var kind = item.GetBaseItemKind();
+        var mediaType = kind switch
+        {
+            BaseItemKind.Movie => StremioMediaType.Movie,
+            BaseItemKind.Series or BaseItemKind.Episode => StremioMediaType.Series,
+            _ => throw new NotSupportedException($"Unsupported BaseItemKind: {kind}"),
+        };
+
+        var stremioId = item.GetProviderId("Stremio");
+        StremioUri? uri = null;
+        if (!string.IsNullOrWhiteSpace(stremioId))
+            uri = new StremioUri(mediaType, stremioId);
+
+        switch (kind)
+        {
+            case BaseItemKind.Movie:
+                {
+                    var imdb = item.GetProviderId(MetadataProvider.Imdb);
+                    return string.IsNullOrWhiteSpace(imdb)
+                        ? uri
+                        : new StremioUri(StremioMediaType.Movie, imdb);
+                }
+            case BaseItemKind.Series:
+                {
+                    var imdb = item.GetProviderId(MetadataProvider.Imdb);
+                    return string.IsNullOrWhiteSpace(imdb)
+                        ? uri
+                        : new StremioUri(StremioMediaType.Series, imdb);
+                }
+            case BaseItemKind.Episode:
+                {
+                    var ep = (Episode)item;
+                    var seriesImdb = ep.Series?.GetProviderId(MetadataProvider.Imdb);
+                    if (
+                        string.IsNullOrWhiteSpace(seriesImdb)
+                        || ep.ParentIndexNumber is null
+                        || ep.IndexNumber is null
+                    )
+                        return uri;
+
+                    var ext = $"{seriesImdb}:{ep.ParentIndexNumber}:{ep.IndexNumber}";
+                    return new StremioUri(StremioMediaType.Series, ext);
+                }
+        }
+
+        return null;
+    }
+
+    public override string ToString()
+    {
+        var type = MediaType == StremioMediaType.Movie ? "movie" : "series";
+        return _streamId is null
+            ? $"stremio://{type}/{ExternalId}"
+            : $"stremio://{type}/{ExternalId}/{_streamId}";
+    }
+
+    public Guid ToGuid()
+    {
+        var hash = MD5.HashData(Encoding.UTF8.GetBytes(ToString()));
+        return new Guid(hash);
+    }
+}
+
+public static class Utils
+{
+    public static long? ParseToTicks(string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            return null;
+
+        input = input.Trim().ToLowerInvariant();
+
+        // Try built-in parse (hh:mm:ss)
+        if (TimeSpan.TryParse(input, out var ts))
+            return ts.Ticks;
+
+        // Try XML ISO8601 style (PT2H29M)
+        try
+        {
+            ts = System.Xml.XmlConvert.ToTimeSpan(input);
+            return ts.Ticks;
+        }
+        catch
+        {
+            // ignore
+        }
+        // Regex fallback for human formats like "2h29min"
+        var h = Regex.Match(input, @"(\d+)\s*h");
+        var m = Regex.Match(input, @"(\d+)\s*min");
+        var s = Regex.Match(input, @"(\d+)\s*s(ec)?");
+
+        var hours = h.Success ? int.Parse(h.Groups[1].Value) : 0;
+        var mins = m.Success ? int.Parse(m.Groups[1].Value) : 0;
+        var secs = s.Success ? int.Parse(s.Groups[1].Value) : 0;
+
+        // If plain number like "149" → minutes
+        if (!h.Success && !m.Success && !s.Success && int.TryParse(input, out var onlyNum))
+            mins = onlyNum;
+
+        return new TimeSpan(hours, mins, secs).Ticks;
+    }
+}
+
+public sealed class KeyLock
+{
+    private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _queues = new();
+    private readonly ConcurrentDictionary<Guid, Lazy<Task>> _inflight = new();
+
+    public Task RunSingleFlightAsync(
+        Guid key,
+        Func<CancellationToken, Task> action,
+        CancellationToken ct = default
+    )
+    {
+        var lazy = _inflight.GetOrAdd(
+            key,
+            _ => new Lazy<Task>(
+                () => Once(key, action, ct),
+                LazyThreadSafetyMode.ExecutionAndPublication
+            )
+        );
+        return lazy.Value;
+    }
+
+    public async Task RunQueuedAsync(
+        Guid key,
+        Func<CancellationToken, Task> action,
+        CancellationToken ct = default
+    )
+    {
+        var sem = _queues.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        await sem.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await action(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            ReleaseAndMaybeRemove(key, sem);
+        }
+    }
+
+    private async Task Once(Guid key, Func<CancellationToken, Task> action, CancellationToken ct)
+    {
+        try
+        {
+            await action(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _inflight.TryRemove(key, out _);
+        }
+    }
+
+    private void ReleaseAndMaybeRemove(Guid key, SemaphoreSlim sem)
+    {
+        sem.Release();
+        if (sem.CurrentCount == 1 && sem.Wait(0))
+        {
+            sem.Release();
+            _queues.TryRemove(key, out _);
+        }
+    }
+}
+
+/// <summary>
+/// Answers asked for ahead of the request that needs them, handed over once.
+/// </summary>
+/// <remarks>
+/// An answer is taken by the first request that asks for its key within
+/// <paramref name="lifetime"/> of its start, still under way or finished, and by nobody after
+/// that: whoever comes later asks for himself. One that failed is dropped, so nobody is handed
+/// a failure he did not wait for; whoever took it while it was under way gets its failure, as
+/// he would have from a request of his own.
+/// </remarks>
+/// <param name="lifetime">How long an answer waits to be taken.</param>
+/// <param name="untaken">Told the key of an answer nobody took within the lifetime.</param>
+public sealed class AheadOfTime<T>(TimeSpan lifetime, Action<string>? untaken = null)
+{
+    private sealed record Entry(Task<T> Answer, long StartedAt);
+
+    private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+
+    private bool IsFresh(Entry entry) =>
+        Environment.TickCount64 - entry.StartedAt < lifetime.TotalMilliseconds;
+
+    /// <summary>
+    /// Starts <paramref name="ask"/> for the key unless one started within the lifetime is
+    /// still waiting to be taken.
+    /// </summary>
+    public void Start(string key, Func<Task<T>> ask)
+    {
+        Entry entry;
+        lock (_entries)
+        {
+            if (_entries.TryGetValue(key, out var kept) && IsFresh(kept))
+                return;
+
+            entry = new Entry(ask(), Environment.TickCount64);
+            _entries[key] = entry;
+        }
+
+        var mine = new KeyValuePair<string, Entry>(key, entry);
+        _ = entry.Answer.ContinueWith(
+            t =>
+            {
+                // Looked at, so that it does not surface as an unobserved exception.
+                _ = t.Exception;
+                _entries.TryRemove(mine);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.NotOnRanToCompletion
+                | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
+        _ = Task.Delay(lifetime)
+            .ContinueWith(
+                _ =>
+                {
+                    if (_entries.TryRemove(mine))
+                        untaken?.Invoke(key);
+                },
+                TaskScheduler.Default
+            );
+    }
+
+    /// <summary>Drops every answer nobody has taken yet.</summary>
+    public void Clear() => _entries.Clear();
+
+    /// <summary>
+    /// The answer started for the key, or null when there is none to hand over. It is gone
+    /// from here either way.
+    /// </summary>
+    public Task<T>? TryTake(string key) =>
+        _entries.TryRemove(key, out var entry)
+        && IsFresh(entry)
+        && !entry.Answer.IsFaulted
+        && !entry.Answer.IsCanceled
+            ? entry.Answer
+            : null;
+}
+
+/// <summary>
+/// Makes URLs safe to write to Jellyfin's log. Stream URLs, addon URLs and the http paths of
+/// stream items carry the user's debrid API key or addon config in their path or query, and
+/// users paste their logs into public issues and chats.
+/// </summary>
+public static class Redact
+{
+    /// <summary>
+    /// Reduces an absolute URL to scheme, host and port, dropping user info, path, query and
+    /// fragment. Local file paths are returned as they are. Anything else that looks like a URL
+    /// but does not parse is replaced entirely, never partially masked.
+    /// </summary>
+    public static string Url(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri))
+        {
+            if (uri.IsFile || uri.IsUnc)
+                return value;
+            return string.IsNullOrEmpty(uri.Authority)
+                ? $"{uri.Scheme}:<redacted>"
+                : $"{uri.Scheme}://{uri.Authority}/<redacted>";
+        }
+
+        return value.Contains("://", StringComparison.Ordinal) ? "<redacted>" : value;
+    }
+}
+
+public static class EnumMappingExtensions
+{
+    public static StremioMediaType ToStremio(this BaseItemKind kind)
+    {
+        return kind switch
+        {
+            BaseItemKind.Movie => StremioMediaType.Movie,
+            BaseItemKind.Series or BaseItemKind.Season or BaseItemKind.Episode =>
+                StremioMediaType.Series,
+            _ => StremioMediaType.Unknown,
+        };
+    }
+
+    public static BaseItemKind ToBaseItem(this StremioMediaType type)
+    {
+        return type switch
+        {
+            StremioMediaType.Movie => BaseItemKind.Movie,
+            StremioMediaType.Series => BaseItemKind.Series,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(type),
+                type,
+                "Unknown StremioMediaType"
+            ),
+        };
+    }
+}
+
+public static class ActionContextExtensions
+{
+    private static readonly string[] RouteGuidKeys =
+    [
+        "id",
+        "Id",
+        "ID",
+        "itemId",
+        "ItemId",
+        "ItemID",
+    ];
+
+    private static readonly string[] IdsGuidKeys = ["ids", "Ids", "IDs"];
+
+    private static readonly HashSet<string> GetItemsActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "GetItems",
+        "GetItemsByUserIdLegacy",
+    };
+
+    private static readonly HashSet<string> BaseItemListActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "GetItems",
+        "GetItemsByUserIdLegacy",
+        "NextUp",
+        "GetResumeItems",
+        "GetResumeItemsLegacy",
+        "GetNextUp",
+        "GetEpisodes",
+        "GetSeasons",
+        "GetSimilarItems",
+        "GetLatestMedia",
+        "GetLatestMediaLegacy",
+        "GetUpcomingEpisodes",
+        "GetRecommendedItems",
+        "GetMovieRecommendations",
+        "GetSuggestionsLegacy",
+        "GetSuggestions",
+        "GetItemCounts",
+        "GetSectionContent",
+        // The search bar's suggestion dropdown. It lists library rows through the item repository
+        // like any other listing, so without it the unreleased filter and the stream-row exclusion
+        // never run for it.
+        "GetSearchHints",
+    };
+
+    // The user data writes. A client offers them from a search result's context menu, before the
+    // result was opened, so they materialize the title like any other insertable action.
+    private static readonly HashSet<string> UserDataActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "MarkPlayedItem",
+        "MarkPlayedItemLegacy",
+        "MarkFavoriteItem",
+        "MarkFavoriteItemLegacy",
+        "UpdateUserItemRating",
+        "UpdateUserItemRatingLegacy",
+        "UpdateItemUserData",
+        "UpdateItemUserDataLegacy",
+    };
+
+    // The ones that reach a series' episodes: played is stored per episode and a folder counts as
+    // played when all of them are, so these need the tree to be complete before they run. A
+    // favourite or a rating is kept on the series itself and does not wait for anything.
+    private static readonly HashSet<string> PlayedStateActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "MarkPlayedItem",
+        "MarkPlayedItemLegacy",
+        "UpdateItemUserData",
+        "UpdateItemUserDataLegacy",
+    };
+
+    private static readonly HashSet<string> InsertableActionNames = new(
+        [
+            "GetItems",
+            "GetItem",
+            "GetItemLegacy",
+            "GetItemsByUserIdLegacy",
+            "GetPlaybackInfo",
+            "GetPostedPlaybackInfo",
+            "GetVideoStream",
+            // Same stream, under a container extension: a separate action that delegates to
+            // GetVideoStream. Clients that play /Videos/{id}/stream.mkv would otherwise get a 404
+            // for a search result that was never opened, because nothing materializes it.
+            "GetVideoStreamByContainer",
+            "GetDownload",
+            "GetSubtitleWithTicks",
+            // The breadcrumb of a details page. jellyfin-web asks for it before it asks for the
+            // item (seen in the browser 2026-09-22: Ancestors 404, then the item 200, then
+            // Ancestors again 200), so nothing has materialized the title when it arrives and
+            // resolving it to an existing item is not enough. The other per-item reads of that
+            // page follow the item call and are answered by the redirect it remembers.
+            "GetAncestors",
+            .. UserDataActionNames,
+            ],
+        StringComparer.OrdinalIgnoreCase
+    );
+
+    // The adds to a collection or a playlist, and the creation of one with items in it. They name
+    // their items in an id list, and a multi-select hands over several search results at once,
+    // none of them opened. Kept out of the insertable actions: those also let a media source
+    // lookup sync the item's streams, which an add to a group has no use for.
+    private static readonly HashSet<string> GroupAddActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "AddToCollection",
+        "AddItemToPlaylist",
+        "CreateCollection",
+        "CreatePlaylist",
+    };
+
+    // Jellyfin answers playback info under two actions: GET /Items/{id}/PlaybackInfo and
+    // POST /Items/{id}/PlaybackInfo. The web client posts, several native clients use the GET.
+    private static readonly HashSet<string> PlaybackInfoActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "GetPlaybackInfo",
+        "GetPostedPlaybackInfo",
+    };
+
+    private static readonly HashSet<string> InsertableListActionNames = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "GetItems",
+        "GetItemsByUserIdLegacy",
+    };
+
+    /// <summary>
+    /// Reads from the request the accessor carries, or returns <paramref name="none"/> when there
+    /// is no request or it has already finished.
+    /// </summary>
+    /// <remarks>
+    /// The accessor's context flows with the ExecutionContext, so work a request started, such as
+    /// a scheduled task run from the dashboard, still sees that request after it has finished.
+    /// Reading a finished request throws ObjectDisposedException, which failed the task on its
+    /// first repository query, so a finished request counts as no request. While Kestrel resets
+    /// the context the request's feature collection is already gone and its properties throw
+    /// NullReferenceException instead, so that counts as finished too.
+    /// </remarks>
+    public static T ReadRequest<T>(
+        this IHttpContextAccessor http,
+        Func<HttpContext, T> read,
+        T none
+    )
+    {
+        if (http.HttpContext is not { } ctx)
+            return none;
+
+        try
+        {
+            if (ctx.Features.Get<IHttpRequestFeature>() is null)
+                return none;
+
+            return read(ctx);
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or NullReferenceException)
+        {
+            return none;
+        }
+    }
+
+    public static string? GetActionName(this ActionExecutingContext ctx) =>
+        (ctx.ActionDescriptor as ControllerActionDescriptor)?.ActionName;
+
+    public static string? GetActionName(this HttpContext ctx) =>
+        ctx.GetEndpoint()?.Metadata.GetMetadata<ControllerActionDescriptor>()?.ActionName;
+
+    public static bool IsApiListing(this HttpContext ctx)
+    {
+        var actionName = ctx.GetActionName();
+        return actionName != null && BaseItemListActionNames.Contains(actionName);
+    }
+
+    /// <summary>
+    /// Whether the request is the TV "Upcoming" list, which asks for episodes that have not aired.
+    /// </summary>
+    public static bool IsUpcomingEpisodes(this HttpContext ctx) =>
+        string.Equals(
+            ctx.GetActionName(),
+            "GetUpcomingEpisodes",
+            StringComparison.OrdinalIgnoreCase
+        );
+
+    /// <summary>
+    /// A search: a listing with a search term, or the search bar's suggestions.
+    /// </summary>
+    /// <remarks>
+    /// Read from the request, for code that has no action context (the item repository). Wider
+    /// than <see cref="TryGetSearchTerm"/> in the actions it takes, narrower in the terms: a blank
+    /// one is no search here.
+    /// </remarks>
+    public static bool IsSearchRequest(this HttpContext ctx) =>
+        !string.IsNullOrWhiteSpace(ctx.Request.Query["searchTerm"])
+        || string.Equals(ctx.GetActionName(), "GetSearchHints", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsHomeScreenSectionListing(this HttpContext ctx)
+    {
+        var action = ctx.GetEndpoint()?.Metadata.GetMetadata<ControllerActionDescriptor>();
+        if (
+            action is not null
+            && string.Equals(
+                action.ControllerName,
+                "HomeScreen",
+                StringComparison.OrdinalIgnoreCase
+            )
+            && string.Equals(
+                action.ActionName,
+                "GetSectionContent",
+                StringComparison.OrdinalIgnoreCase
+            )
+        )
+        {
+            return true;
+        }
+
+        var path = ctx.Request.Path;
+        return path.HasValue
+            && path.Value?.Contains("/HomeScreen/Section/", StringComparison.OrdinalIgnoreCase)
+                == true;
+    }
+
+    /// <summary>
+    /// Whether the action is GetItems, the listing behind the search page, a person's page and
+    /// most library views. Whether it searches is <see cref="TryGetSearchTerm"/>.
+    /// </summary>
+    public static bool IsGetItemsAction(this ActionExecutingContext ctx) =>
+        ctx.GetActionName() is { } actionName && GetItemsActionNames.Contains(actionName);
+
+    /// <summary>
+    /// A GetItems call that names a search term: the term as the action received it, a blank one
+    /// included. <see cref="IsSearchRequest"/> is the test for code without an action context.
+    /// </summary>
+    public static bool TryGetSearchTerm(this ActionExecutingContext ctx, out string searchTerm)
+    {
+        searchTerm = string.Empty;
+        return ctx.IsGetItemsAction() && ctx.TryGetActionArgument("searchTerm", out searchTerm!);
+    }
+
+    public static bool IsPlaybackInfoAction(this HttpContext? ctx) =>
+        ctx?.GetActionName() is { } actionName && PlaybackInfoActionNames.Contains(actionName);
+
+    /// <summary>
+    /// Whether the action answers with the item's media sources whatever the request asks for:
+    /// the item itself (Jellyfin builds it with every field) and its playback info. Listing
+    /// them is what syncs a movie's or an episode's streams.
+    /// </summary>
+    public static bool ListsMediaSources(this ActionExecutingContext ctx) =>
+        ctx.GetActionName() is { } actionName
+        && (
+            PlaybackInfoActionNames.Contains(actionName)
+            || actionName.Equals("GetItem", StringComparison.OrdinalIgnoreCase)
+            || actionName.Equals("GetItemLegacy", StringComparison.OrdinalIgnoreCase)
+        );
+
+    /// <summary>
+    /// The query flag Gelato's injected script (item-menu.js) adds to the item request of Jellyfin
+    /// Web's item menu (right-click, or a card's three dots).
+    /// </summary>
+    public const string ItemMenuFlag = "gelatoMenu";
+
+    /// <summary>
+    /// Whether the request is the item menu's read of the item. It is the same call as the
+    /// details page's, and only the flag tells them apart. The menu needs the item as the
+    /// library has it: no stream sync, no pre-probe, and a search result stays one until an
+    /// action of the menu names it.
+    /// </summary>
+    public static bool IsItemMenuRead(this HttpContext ctx) =>
+        ctx.Request.Query.ContainsKey(ItemMenuFlag)
+        && ctx.GetActionName() is "GetItem" or "GetItemLegacy";
+
+    /// <summary>
+    /// Actions of the item menu that name a search result by its id without reading the item
+    /// first (Refresh metadata, a series' Shuffle and Download all). The menu's read used to put
+    /// the title in; now the action does. They are not insertable actions: no stream sync, and a
+    /// local series' tree is not touched by listing its seasons.
+    /// </summary>
+    private static readonly HashSet<string> SearchResultWriteActionNames = new(
+        ["RefreshItem", "GetEpisodes", "GetSeasons"],
+        StringComparer.OrdinalIgnoreCase
+    );
+
+    public static bool IsSearchResultWriteAction(this ActionExecutingContext ctx) =>
+        ctx.GetActionName() is { } actionName && SearchResultWriteActionNames.Contains(actionName);
+
+    /// <summary>
+    /// The id a request names in its route: the item's, or the series' of a season or episode
+    /// listing.
+    /// </summary>
+    public static bool TryGetRouteItemOrSeriesGuid(this ActionExecutingContext ctx, out Guid value) =>
+        ctx.TryGetRouteGuid(out value)
+        || ctx.RouteData.Values.TryGetValue("seriesId", out var raw)
+            && Guid.TryParse(raw?.ToString(), out value);
+
+    public static bool IsInsertableAction(this HttpContext ctx)
+    {
+        var actionName = ctx.GetActionName();
+        return actionName != null
+            && InsertableActionNames.Contains(actionName)
+            && !ctx.IsItemMenuRead()
+            && (
+                !InsertableListActionNames.Contains(actionName)
+                || InsertableListActionNames.Contains(actionName) && IsSingleItemList(ctx)
+            );
+    }
+
+    public static bool IsInsertableAction(this ActionExecutingContext ctx) =>
+        ctx.HttpContext.IsInsertableAction();
+
+    public static bool IsGroupAddAction(this ActionExecutingContext ctx) =>
+        ctx.GetActionName() is { } actionName && GroupAddActionNames.Contains(actionName);
+
+    /// <summary>
+    /// The ids an action was given as a list, or none when it takes no such list.
+    /// </summary>
+    /// <remarks>
+    /// Jellyfin has three shapes for it: guids in the query (the adds, and CreatePlaylist's
+    /// obsolete query form), strings in the query (CreateCollection) and a list in the request
+    /// body (CreatePlaylist).
+    /// </remarks>
+    public static IReadOnlyList<Guid> GetIdList(this ActionExecutingContext ctx)
+    {
+        var all = new List<Guid>();
+        foreach (var (key, value) in ctx.ActionArguments)
+        {
+            switch (value)
+            {
+                case Guid[] ids when IdsGuidKeys.Contains(key):
+                    all.AddRange(ids);
+                    break;
+                case string[] ids when IdsGuidKeys.Contains(key):
+                    all.AddRange(ids.Where(s => Guid.TryParse(s, out _)).Select(Guid.Parse));
+                    break;
+                case not null when TryGetBodyIdList(value, out _, out var ids):
+                    all.AddRange(ids);
+                    break;
+            }
+        }
+
+        return all;
+    }
+
+    /// <summary>
+    /// The id list a request body carries, as the body of CreatePlaylist does. It is one of
+    /// Jellyfin's API models, which a plugin does not reference, so the list is found by name.
+    /// </summary>
+    private static bool TryGetBodyIdList(object body, out PropertyInfo property, out Guid[] ids)
+    {
+        property = null!;
+        ids = [];
+        if (
+            body is string or Array or ValueType
+            || body.GetType().GetProperty("Ids") is not { CanWrite: true } found
+            || !found.PropertyType.IsAssignableFrom(typeof(Guid[]))
+            || found.GetValue(body) is not IEnumerable<Guid> list
+        )
+            return false;
+
+        property = found;
+        ids = list.ToArray();
+        return true;
+    }
+
+    /// <summary>
+    /// Whether the request may be answered from the library item a search result is, without
+    /// materializing anything: every safe read.
+    /// </summary>
+    /// <remarks>
+    /// A client that opened a search result keeps the result's id in the page URL and asks for
+    /// the ancestors, similar items, theme media and the rest with it. None of those actions
+    /// insert, so they are not insertable actions, and Jellyfin has never stored the id: the
+    /// breadcrumb of a title the library already holds answered 404. Resolving the id to the
+    /// item it belongs to costs a cache lookup for ids no search produced.
+    /// </remarks>
+    public static bool IsCanonicalIdRead(this HttpContext ctx) =>
+        HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method);
+
+    public static bool IsCanonicalIdRead(this ActionExecutingContext ctx) =>
+        ctx.HttpContext.IsCanonicalIdRead();
+
+    /// <summary>
+    /// The played state a user data write asks for, or null when the action does not set one. The
+    /// mark actions say played; the generic update carries the flag in its body.
+    /// </summary>
+    public static bool? WantsPlayedState(this ActionExecutingContext ctx)
+    {
+        if (
+            ctx.GetActionName() is not { } actionName
+            || !PlayedStateActionNames.Contains(actionName)
+        )
+            return null;
+
+        if (!actionName.StartsWith("UpdateItemUserData", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // The body is one of Jellyfin's API models, which a plugin does not reference.
+        foreach (var argument in ctx.ActionArguments.Values)
+        {
+            if (argument?.GetType().GetProperty("Played")?.GetValue(argument) is bool played)
+                return played;
+        }
+
+        return null;
+    }
+
+    public static bool IsSingleItemList(this HttpContext ctx)
+    {
+        var q = ctx.Request.Query;
+        if (!q.TryGetValue("ids", out var idsRaw))
+            return false;
+
+        var ids = idsRaw
+            .SelectMany(v =>
+                v.ToString()
+                    .Split(
+                        ',',
+                        StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries
+                    )
+            )
+            .ToArray();
+
+        return ids.Length == 1;
+    }
+
+    public static bool IsSingleItemList(this ActionExecutingContext ctx) =>
+        ctx.HttpContext.IsSingleItemList();
+
+    /// <summary>
+    /// Whether the caller itself asked for specific item ids.
+    /// </summary>
+    /// <remarks>
+    /// Jellyfin 12 resolves a searchTerm to matching ids before it queries the repository, so
+    /// InternalItemsQuery.ItemIds is populated for ordinary searches too. Only the query string
+    /// distinguishes a caller-supplied id lookup from one the search manager produced.
+    /// </remarks>
+    public static bool HasExplicitItemIds(this HttpContext ctx) =>
+        ctx.Request.Query.ContainsKey("ids");
+
+    public static bool TryGetRouteGuid(this ActionExecutingContext ctx, out Guid value)
+    {
+        value = Guid.Empty;
+        return ctx.TryGetRouteGuidString(out var s) && Guid.TryParse(s, out value);
+    }
+
+    private static bool TryGetRouteGuidString(this ActionExecutingContext ctx, out string value)
+    {
+        value = string.Empty;
+
+        // Check if already resolved
+        if (ctx.HttpContext.Items["GuidResolved"] is Guid g)
+        {
+            value = g.ToString("N");
+            return true;
+        }
+
+        var rd = ctx.RouteData.Values;
+
+        // Check route values
+        foreach (var key in RouteGuidKeys)
+        {
+            if (
+                rd.TryGetValue(key, out var raw)
+                && raw?.ToString() is { } s
+                && !string.IsNullOrWhiteSpace(s)
+            )
+            {
+                value = s;
+                return true;
+            }
+        }
+
+        // Fallback: check query string "ids"
+        var query = ctx.HttpContext.Request.Query;
+        if (
+            query.TryGetValue("ids", out var ids)
+            && ids.Count == 1
+            && !string.IsNullOrWhiteSpace(ids[0])
+        )
+        {
+            value = ids[0]!;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Replaces every id in the route, the query-bound arguments and id lists that
+    /// <paramref name="map"/> knows a replacement for. Returns whether anything changed.
+    /// </summary>
+    /// <remarks>
+    /// An id list is not always a <c>Guid[]</c>: CreateCollection binds its ids as strings and
+    /// CreatePlaylist takes them in its body. Left as they were, a search result that had been
+    /// opened still reached Jellyfin under its stand-in id: the new collection answered 400, the
+    /// new playlist 200 and stayed empty.
+    /// </remarks>
+    public static bool RedirectGuids(this ActionExecutingContext ctx, Func<Guid, Guid?> map)
+    {
+        var changed = false;
+        foreach (var (key, raw) in ctx.RouteData.Values.ToList())
+        {
+            if (raw?.ToString() is { } s && Guid.TryParse(s, out var g) && map(g) is { } to)
+            {
+                ctx.RouteData.Values[key] = to.ToString("N");
+                if (ctx.ActionArguments.ContainsKey(key))
+                    ctx.ActionArguments[key] = to;
+                ctx.HttpContext.Items["GuidResolved"] = to;
+                changed = true;
+            }
+        }
+
+        foreach (var (key, value) in ctx.ActionArguments.ToList())
+        {
+            switch (value)
+            {
+                case Guid g when map(g) is { } to:
+                    ctx.ActionArguments[key] = to;
+                    changed = true;
+                    break;
+                case Guid[] ids when ids.Any(g => map(g) is not null):
+                    ctx.ActionArguments[key] = ids.Select(g => map(g) ?? g).Distinct().ToArray();
+                    changed = true;
+                    break;
+                case string[] ids
+                    when IdsGuidKeys.Contains(key)
+                        && ids.Any(s => Guid.TryParse(s, out var g) && map(g) is not null):
+                    ctx.ActionArguments[key] = ids.Select(s =>
+                            Guid.TryParse(s, out var g) && map(g) is { } to ? to.ToString("N") : s
+                        )
+                        .Distinct()
+                        .ToArray();
+                    changed = true;
+                    break;
+                case not null
+                    when TryGetBodyIdList(value, out var property, out var ids)
+                        && ids.Any(g => map(g) is not null):
+                    property.SetValue(value, ids.Select(g => map(g) ?? g).Distinct().ToArray());
+                    changed = true;
+                    break;
+            }
+        }
+
+        return changed;
+    }
+
+    public static void ReplaceGuid(this ActionExecutingContext ctx, Guid value)
+    {
+        var rd = ctx.RouteData.Values;
+
+        foreach (var key in RouteGuidKeys)
+        {
+            if (rd.TryGetValue(key, out var raw) && raw is not null)
+            {
+                rd[key] = value.ToString();
+                ctx.ActionArguments[key] = value;
+            }
+        }
+
+        // Also replace ids query-parameter argument (used by list actions like GetItems)
+        foreach (var key in IdsGuidKeys)
+        {
+            if (ctx.ActionArguments.ContainsKey(key))
+            {
+                ctx.ActionArguments[key] = new[] { value };
+                break;
+            }
+        }
+
+        ctx.HttpContext.Items["GuidResolved"] = value;
+    }
+
+    public static bool TryGetUserId(this ActionExecutingContext ctx, out Guid userId)
+    {
+        return ctx.HttpContext.TryGetUserId(out userId);
+    }
+
+    /// <summary>
+    /// The user a request acts for: the one its token authenticated, or, when the token carries
+    /// none, the one the caller names in the query or in the route.
+    /// </summary>
+    /// <remarks>
+    /// An API key authenticates without a user, and Jellyfin still puts a UserId claim on the
+    /// request: the empty guid. Taking the claim as the answer hid the user the caller had
+    /// named, and a search result opened with an API key materialized for nobody: the request
+    /// reached Jellyfin with the synthetic id and answered 404.
+    /// </remarks>
+    public static bool TryGetUserId(this HttpContext ctx, out Guid userId)
+    {
+        string?[] candidates =
+        [
+            ctx.User.Claims.FirstOrDefault(c => c.Type is "UserId" or "Jellyfin-UserId")?.Value,
+            ctx.Request.Query["userId"].FirstOrDefault(),
+            ctx.Request.RouteValues.TryGetValue("userId", out var route) ? route?.ToString() : null,
+        ];
+
+        foreach (var candidate in candidates)
+        {
+            if (Guid.TryParse(candidate, out userId) && userId != Guid.Empty)
+                return true;
+        }
+
+        userId = Guid.Empty;
+        return false;
+    }
+
+    public static bool TryGetActionArgument<T>(
+        this ActionExecutingContext ctx,
+        string key,
+        out T value,
+        T defaultValue = default
+    )
+    {
+        if (ctx.ActionArguments.TryGetValue(key, out var objValue) && objValue is T typedValue)
+        {
+            value = typedValue;
+            return true;
+        }
+
+        value = defaultValue;
+        return false;
+    }
+}
+
+public static class BaseItemExtensions
+{
+    /// <summary>
+    /// Drops the EndDate a Gelato metadata result carries when the refreshed item is not Gelato's
+    /// own. <see cref="GelatoManager.IntoBaseItem"/> always sets EndDate, since the unreleased
+    /// filter needs one, but on a native item that is metadata the library never had: a running
+    /// series ends up with an end date, and an item whose release is unknown with the 9999
+    /// sentinel. Jellyfin only fills an empty EndDate, so the value stays until a metadata replace.
+    /// <paramref name="sourceProviderIds"/> are the ids of the item being refreshed.
+    /// </summary>
+    public static void KeepEndDateOnlyForGelato(
+        this BaseItem item,
+        IReadOnlyDictionary<string, string> sourceProviderIds
+    )
+    {
+        if (
+            !sourceProviderIds.TryGetValue("Stremio", out var stremioId)
+            || string.IsNullOrWhiteSpace(stremioId)
+        )
+        {
+            item.EndDate = null;
+        }
+    }
+
+    private static readonly ConditionalWeakTable<BaseItem, object> ItemsNotInLibrary = new();
+    private static readonly object NotInLibraryMark = new();
+
+    /// <summary>
+    /// Marks an item built for a search result whose id no item of the library has, as its own
+    /// or as the owner of a version. What the database holds per item (linked versions, media
+    /// streams, attachments) can only be empty for it, so nobody has to ask.
+    /// </summary>
+    /// <remarks>
+    /// The mark is on the instance, not on the id: the item the result becomes when it is opened
+    /// is another instance with the same id, and that one is in the library.
+    /// </remarks>
+    public static void MarkNotInLibrary(this BaseItem item) =>
+        ItemsNotInLibrary.AddOrUpdate(item, NotInLibraryMark);
+
+    public static bool IsNotInLibrary(this BaseItem item) =>
+        ItemsNotInLibrary.TryGetValue(item, out _);
+
+    /// <summary>
+    /// The movie/episode a stream row is a version of; any other item as it is.
+    /// </summary>
+    public static BaseItem PrimaryVersionOrSelf(
+        this BaseItem item,
+        ILibraryManager libraryManager
+    ) =>
+        item.IsStreamRow()
+        && (item as Video)?.PrimaryVersionId is { } primaryId
+        && libraryManager.GetItemById(primaryId) is { } primary
+            ? primary
+            : item;
+
+    public static T? GelatoData<T>(this BaseItem item, string key)
+    {
+        if (string.IsNullOrEmpty(item.ExternalId))
+            return default;
+
+        try
+        {
+            var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(item.ExternalId);
+            return dict != null && dict.TryGetValue(key, out var el)
+                ? el.Deserialize<T>()
+                : default;
+        }
+        catch
+        {
+            return default;
+        }
+    }
+
+    public static void SetGelatoData<T>(this BaseItem item, string key, T value)
+    {
+        Dictionary<string, JsonElement> data;
+
+        try
+        {
+            data = string.IsNullOrEmpty(item.ExternalId)
+                ? new Dictionary<string, JsonElement>()
+                : JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(item.ExternalId)
+                    ?? new Dictionary<string, JsonElement>();
+        }
+        catch
+        {
+            data = new Dictionary<string, JsonElement>();
+        }
+
+        data[key] = JsonSerializer.SerializeToElement(value);
+        item.ExternalId = JsonSerializer.Serialize(data);
+    }
+
+    private static readonly HashSet<string> SubtitleExtensions = new(
+        StringComparer.OrdinalIgnoreCase
+    )
+    {
+        "vtt",
+        "srt",
+        "ass",
+        "ssa",
+        "sub",
+        "idx",
+        "smi",
+    };
+
+    /// <summary>
+    /// The file name Gelato hands Jellyfin when it saves a subtitle: the release filename the addon
+    /// sent, or <c>{id}.strm</c> when it sent none. A Gelato path is a URL or a <c>gelato://stub</c>,
+    /// which Jellyfin would turn into a name nothing looks for afterwards.
+    /// </summary>
+    public static string GelatoSubtitlePathName(this BaseItem item)
+    {
+        var gelatoFilename = item.GelatoData<string>("filename");
+        return string.IsNullOrEmpty(gelatoFilename) ? $"{item.Id:N}.strm" : gelatoFilename;
+    }
+
+    /// <summary>
+    /// The part Jellyfin puts in front of <c>.{lang}.{ext}</c>, derived from
+    /// <see cref="GelatoSubtitlePathName"/> the same way Jellyfin derives it from a media path.
+    /// </summary>
+    public static string GelatoSubtitleBaseName(this BaseItem item) =>
+        Path.GetFileNameWithoutExtension(item.GelatoSubtitlePathName());
+
+    /// <summary>
+    /// Subtitle files saved for a Gelato item in its internal metadata folder, named
+    /// <c>{base}.{lang}.{ext}</c> or <c>{base}.{lang}.{N}.{ext}</c>. Jellyfin never records them as
+    /// media streams because the item has no local file, so Gelato has to look itself.
+    /// </summary>
+    public static IEnumerable<(string Path, string Language, string Codec)> GetGelatoSubtitleFiles(
+        this BaseItem item
+    )
+    {
+        var metaPath = item.GetInternalMetadataPath();
+        if (!Directory.Exists(metaPath))
+            yield break;
+
+        var baseName = item.GelatoSubtitleBaseName();
+
+        foreach (var file in Directory.EnumerateFiles(metaPath))
+        {
+            var fname = Path.GetFileName(file);
+
+            // Must start with baseName + "."
+            if (!fname.StartsWith(baseName + ".", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var ext = Path.GetExtension(fname).TrimStart('.');
+            if (!SubtitleExtensions.Contains(ext))
+                continue;
+
+            // Parse language from suffix: {baseName}.{lang}.{ext} or {baseName}.{lang}.{N}.{ext}
+            var suffix = fname.Substring(baseName.Length + 1); // everything after "baseName."
+            var parts = Path.GetFileNameWithoutExtension(suffix).Split('.');
+            var langCode = parts.Length > 0 ? parts[0] : "und";
+
+            yield return (file, langCode, ext.ToLowerInvariant());
+        }
+    }
+}
+
+public static class StringExtensions
+{
+    public static bool IsUrl(this string s) =>
+        s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+        || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+}
+
+public static class MediaSourceExtensions
+{
+    /// <summary>
+    /// Hands the client a stub on the File protocol instead of the stream's own path. The addon
+    /// URL carries the debrid API key and names a host only Jellyfin has to reach, so no response
+    /// a client can ask for may contain it; File and a path the client cannot open is what makes
+    /// clients stream through Jellyfin, which resolves the real URL again. A placeholder
+    /// (gelato://, stremio://) is stubbed the same way, there is no file behind it either. A real
+    /// file path is left alone, so a version merged in by hand still direct-plays from the share.
+    /// </summary>
+    public static bool Stub(this MediaSourceInfo source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+
+        if (source.Path is not { Length: > 0 } path || !IsStubbed(path))
+            return false;
+
+        source.Path = "/stub";
+        source.IsRemote = false;
+        source.Protocol = MediaProtocol.File;
+        return true;
+    }
+
+    private static bool IsStubbed(string path) =>
+        path.IsUrl() || path.IsPlaceholderPath();
+}
