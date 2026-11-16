@@ -16,7 +16,7 @@
     <PackageReference Include="Jellyfin.Common" Version="12.1.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageReference Include="System.Reflection.TypeExtensions" Version="4.7.0" />
-    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="11.0.0" PrivateAssets="all" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Config\config.html" />
