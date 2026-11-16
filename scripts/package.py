@@ -14,12 +14,12 @@ numeric = version+'.0'
 out=ROOT/'dist';out.mkdir(exist_ok=True)
 dll=out/'build/Strimarr.dll'
 if not dll.is_file(): raise SystemExit('Build dist/build/Strimarr.dll first')
-meta={'name':'Strimarr','guid':'b137092c-cc78-4c6e-b1a5-c3a1aa587a1d','version':numeric,'targetAbi':'12.1.0.0','framework':'net10.0','overview':'Metadata-first AIOStreams integration for Jellyfin','description':'A GPL-3.0 Gelato derivative with background discovery and bounded HTTP relay.','owner':'Ankitd013','status':'Active','autoUpdate':True}
+meta={'name':'Strimarr','guid':'b137092c-cc78-4c6e-b1a5-c3a1aa587a1d','version':numeric,'targetAbi':'12.1.0.0','framework':'net10.0','overview':'Metadata-first AIOStreams integration for Jellyfin','description':'A GPL-3.0 Gelato derivative with background discovery and bounded HTTP relay.','owner':'Ankitd013','status':'Active','autoUpdate':True,'imagePath':'banner.png'}
 archive=out/f'Strimarr-{numeric}.zip'
 with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
     z.write(dll,'Strimarr.dll')
     z.writestr('meta.json',json.dumps(meta,indent=2)+'\n')
-    for name in ['LICENSE','NOTICE.md','README.md']: z.write(ROOT/name,name)
+    for name in ['LICENSE','NOTICE.md','README.md','logo.svg','banner.png']: z.write(ROOT/name,name)
 source=out/f'Strimarr-{args.tag}-source.zip'
 tracked=subprocess.check_output(['git','ls-files','-z'],cwd=ROOT).decode().split('\0')
 if not any(tracked): raise SystemExit('Stage audited source files before packaging')
@@ -30,6 +30,7 @@ with zipfile.ZipFile(source,'w',zipfile.ZIP_DEFLATED) as z:
 url=f'https://github.com/Ankitd013/strimarr/releases/download/{args.tag}/{archive.name}'
 entry={k:meta[k] for k in ['guid','name','overview','description','owner']}
 entry['category']='General'
+entry['imageUrl']='https://raw.githubusercontent.com/Ankitd013/strimarr/main/banner.png'
 entry['versions']=[{'version':numeric,'targetAbi':'12.1.0.0','sourceUrl':url,'checksum':hashlib.md5(archive.read_bytes()).hexdigest(),'timestamp':datetime.now(timezone.utc).isoformat(),'changelog':f'{args.tag}: public candidate; see CHANGELOG.md and validation limits.'}]
 manifest=out/'release-manifest.json';manifest.write_text(json.dumps([entry],indent=2)+'\n')
 assets=[archive,source,manifest]
