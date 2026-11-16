@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Strimarr</title>
+  <desc id="description">An S-shaped stream in mint and blue on a dark rounded square.</desc>
+  <defs>
+    <linearGradient id="tile" x1="16" y1="8" x2="144" y2="152" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B2B3D"/>
+      <stop offset="1" stop-color="#0B1421"/>
+    </linearGradient>
+    <linearGradient id="stream" x1="46" y1="44" x2="115" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#78F0C4"/>
+      <stop offset="0.5" stop-color="#54D9DC"/>
+      <stop offset="1" stop-color="#739BFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#tile)"/>
+  <rect x="5.75" y="5.75" width="148.5" height="148.5" rx="37.25" stroke="#54718B" stroke-opacity="0.45" stroke-width="1.5"/>
+  <path d="M111 48H65C53.4 48 44 55.2 44 65C44 74.8 53.4 82 65 82H95C106.6 82 116 89.2 116 99C116 108.8 106.6 116 95 116H49" stroke="url(#stream)" stroke-width="19" stroke-linecap="round"/>
+  <circle cx="111" cy="48" r="4" fill="#D5FFF0"/>
+  <circle cx="49" cy="116" r="4" fill="#C7D5FF"/>
+</svg>

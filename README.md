@@ -1,6 +1,20 @@
-# Strimarr
-
-Jellyfin plugin for AIOStreams catalogs, search, and on-demand streaming.
+<div align="center">
+  <img src="logo.svg" width="112" height="112" alt="Strimarr logo">
+  <h1>Strimarr</h1>
+  <p>Jellyfin · AIOStreams · On-demand streaming</p>
+  <p>
+    <a href="https://github.com/Ankitd013/strimarr/actions/workflows/ci.yml"><img src="https://github.com/Ankitd013/strimarr/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push" alt="Build and verification status"></a>
+    <a href="https://github.com/Ankitd013/strimarr/releases"><img src="https://img.shields.io/github/v/release/Ankitd013/strimarr?include_prereleases&amp;style=flat&amp;label=release&amp;color=58a6ff" alt="Latest release, including release candidates"></a>
+    <a href="docs/COMPATIBILITY.md"><img src="https://img.shields.io/badge/Jellyfin-12-00a4dc?style=flat" alt="Targets Jellyfin 12; see compatibility details"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-63c5a5?style=flat" alt="GPL-3.0 license"></a>
+  </p>
+  <p>
+    <a href="#installation">Install</a> ·
+    <a href="docs/QUICKSTART.md">Setup guide</a> ·
+    <a href="https://github.com/Ankitd013/strimarr/releases">Releases</a> ·
+    <a href="https://github.com/Ankitd013/strimarr/issues">Issues</a>
+  </p>
+</div>
 
 Strimarr brings the titles from your AIOStreams configuration into Jellyfin as library items. Browse their details while streams are found in the background, then choose a version and play it through Jellyfin.
 
