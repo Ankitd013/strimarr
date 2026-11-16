@@ -2,7 +2,22 @@
 
 Report reproducible bugs with Jellyfin/client/plugin versions and sanitized logs. Never attach a provider backup, cookie, API token, or complete signed stream URL. Use synthetic fixtures for tests.
 
-Build with .NET 10, run the commands in README, and keep changes compatible with the retained upstream source. Preserve GPL notices. Keep Jellyfin and Seerr core files untouched. Do not add source-provider credentials or proprietary bridge binaries.
+Build with .NET 10 and keep changes compatible with the retained upstream source. Preserve GPL notices. Keep Jellyfin and Seerr core files untouched. Do not add source-provider credentials or proprietary bridge binaries.
+
+## Build and verify
+
+These commands are for developers. Dashboard users do not need an SDK or a source build.
+
+```sh
+dotnet build src/Strimarr/Gelato.csproj -c Release -o dist/build
+dotnet run --project tests/Relay/RelayTests.csproj --no-launch-profile
+dotnet run --project tests/Configuration/ConfigurationTests.csproj
+node tests/frontend/metadata-first.cjs
+python scripts/check_publication.py
+python scripts/package.py --tag v1.1.0-rc.1
+```
+
+The project/namespace retain upstream identifiers for embedded-resource compatibility; output is `Strimarr.dll`. Keep screenshot provenance and the dated compatibility record accurate when updating documentation. Do not depict untested behavior as verified, or include movie artwork, private server addresses or credentials in screenshots.
 
 ## Release maintenance
 

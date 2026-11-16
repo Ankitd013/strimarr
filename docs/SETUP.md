@@ -1,5 +1,7 @@
 # Setup and migration
 
+**New installation? Start with the [illustrated dashboard guide](QUICKSTART.md).** This page covers advanced settings and migration. Check the [compatibility record](COMPATIBILITY.md) before upgrading Jellyfin.
+
 ## Service chain
 
 ```text

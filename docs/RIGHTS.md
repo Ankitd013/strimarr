@@ -1,0 +1,17 @@
+# Rights, attribution and screenshots
+
+Strimarr is a modified Gelato derivative. The [GPL-3.0 license](../LICENSE), [distribution notices](../NOTICE.md), upstream attribution and modification record are retained. Matching source is supplied with the release. A disclaimer does not relicense third-party software.
+
+## Documentation images
+
+The screenshots in [images/](images/) were captured for this guide on a new, empty Jellyfin 12.4 demonstration server. They show administration/setup, not movie playback. No movie posters, film frames, promotional backdrops, music artwork, provider accounts, cookies, signed stream URLs or personal library data are included. The library image is an element-level capture excluding generated server/webhook addresses below it. Images are not presented as proof of untested playback.
+
+The depicted Jellyfin interface/logo belongs to the [Jellyfin project](https://github.com/jellyfin/jellyfin-web); its [license](https://github.com/jellyfin/jellyfin-web/blob/master/LICENSE) and trademark rights remain with their respective holders. The inherited Gelato interface/artwork is credited under the retained GPL notices. Capturing a screen does not make every depicted element exclusively ours or public domain. These images document setup/interoperability and do not imply endorsement.
+
+This repository/release does not bundle movies, provider backups, media artwork, paid-service credentials or CNCVerse Bridge binaries/source. External components remain under their own terms; obtain them from their publishers. Strimarr's GPL does not grant rights to unrelated software or media.
+
+## Claims and limitations
+
+Use sources/content you are authorized to access. Strimarr does not add DRM bypass or proxy/IP restriction circumvention. Careful asset selection, source availability and license compliance reduce avoidable issues but cannot prevent someone submitting a claim or establish that every use is lawful. GitHub explains its notice/counter-notice process in its [DMCA policy](https://docs.github.com/en/site-policy/content-removal-policies/dmca-takedown-policy).
+
+Nothing here guarantees immunity from copyright, trademark or DMCA claims; this is not a legal opinion. For a suspected rights issue, identify the exact file/image and relevant ownership/license information through the repository's issue/contact process. Omit credentials; security issues follow [SECURITY.md](../SECURITY.md).

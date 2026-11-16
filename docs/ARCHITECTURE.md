@@ -18,7 +18,7 @@ This improves some slow single-connection sources. It cannot overcome an aggrega
 
 ## Validation scope
 
-The underlying private integration was exercised on Jellyfin 12.3.0 and Moonfin/Jellyfin Web, including audio changes. The renamed public release has compile and isolated regression coverage; it has not been deployed over the user's running server as part of publication. It therefore starts as a release candidate.
+The underlying private integration was exercised on Jellyfin 12.3.0 and Moonfin/Jellyfin Web, including audio changes. The public release has compile/isolated regression coverage and a clean dashboard-install/load/settings-opening check on Jellyfin 12.4.0. It was not deployed over the user's running server for publication/documentation. It remains a release candidate; the 12.4 check is not full playback certification. See the [dated compatibility record](COMPATIBILITY.md).
 
 Automated relay tests use local synthetic bytes and cover full/open/closed/suffix ranges, HEAD, unsatisfiable ranges, range-ignoring servers, transient errors, redirects, client disconnects, repeated-range cache reuse, mismatched Content-Range rejection, local-only access, missing capabilities, and concurrent registration. Frontend tests cover empty/error status, polling termination, and hidden controls. These do not constitute a full server/client integration suite, penetration test, or whole-movie guarantee.
 
