@@ -1,1 +1,20 @@
-[]
+[
+  {
+    "guid": "b137092c-cc78-4c6e-b1a5-c3a1aa587a1d",
+    "name": "Strimarr",
+    "overview": "Metadata-first AIOStreams integration for Jellyfin",
+    "description": "A GPL-3.0 Gelato derivative with background discovery and bounded HTTP relay.",
+    "owner": "Ankitd013",
+    "category": "General",
+    "versions": [
+      {
+        "version": "1.1.0.0",
+        "targetAbi": "12.1.0.0",
+        "sourceUrl": "https://github.com/Ankitd013/strimarr/releases/download/v1.1.0-rc.1/Strimarr-1.1.0.0.zip",
+        "checksum": "ab259ca71375af60ac6d4746f7c7e001",
+        "timestamp": "2026-11-16T09:42:24.397229+00:00",
+        "changelog": "v1.1.0-rc.1: public candidate; see CHANGELOG.md and validation limits."
+      }
+    ]
+  }
+]
